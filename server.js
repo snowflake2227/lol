@@ -11,8 +11,8 @@ app.use(cors());
 app.use(express.json());
 
 // CDEK API credentials (в реальном проекте хранить в .env)
-const CDEK_API_KEY = process.env.CDEK_API_KEY || 'wqGwiQx0gg8mLtiEKsUinjVSICCjtTEP';
-const CDEK_API_PASSWORD = process.env.CDEK_API_PASSWORD || 'RmAmgvSgSl1yirlz9QupbzOJVqhCxcP5';
+const CDEK_API_KEY = process.env.CDEK_API_KEY || 'IZXbP5gbWNq0TJQdXcdVTT3x3J349HGe';
+const CDEK_API_PASSWORD = process.env.CDEK_API_PASSWORD || 'OatOZl0Zungypwe807b4pYxNmZgsgMrX';
 
 // Routes
 app.get('/api/health', (req, res) => {
