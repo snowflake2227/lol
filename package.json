@@ -1,0 +1,29 @@
+{
+  "name": "illusive-store-backend",
+  "version": "1.0.0",
+  "description": "Backend for Illusive Store e-commerce",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "ecommerce",
+    "store",
+    "cdek",
+    "payments",
+    "nodejs"
+  ],
+  "author": "Illusive Store",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "devDependencies": {}
+}
