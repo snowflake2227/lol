@@ -1,18 +1,21 @@
 {
   "name": "illusive-store-backend",
   "version": "1.0.0",
-  "description": "Backend for Illusive Store e-commerce",
+  "description": "Backend for Illusive Store e-commerce with real CDEK integration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "deploy": "node server.js",
+    "test": "echo \"No tests specified\" && exit 0"
   },
   "keywords": [
     "ecommerce",
     "store",
     "cdek",
     "payments",
-    "nodejs"
+    "nodejs",
+    "express"
   ],
   "author": "Illusive Store",
   "license": "MIT",
@@ -23,7 +26,10 @@
     "node-fetch": "^2.7.0"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
 }
