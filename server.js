@@ -231,7 +231,7 @@ app.post('/api/cdek/calculate', async (req, res) => {
         const calculateUrl = 'https://api.cdek.ru/v2/calculator/tarifflist';
         
         const requestData = {
-            from_location: from_location || { code: 44 }, // Москва по умолчанию
+            from_location: from_location || { code: 270 }, // Москва по умолчанию
             to_location: to_location,
             packages: packages,
             services: []
