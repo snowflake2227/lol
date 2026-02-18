@@ -1,48 +1,201 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+const PORT = Number(process.env.PORT || 3000);
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const TRUST_PROXY = process.env.TRUST_PROXY || '1';
+const MAX_JSON_BODY = process.env.MAX_JSON_BODY || '256kb';
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 120);
+const MAX_PAYMENT_AMOUNT = Number(process.env.MAX_PAYMENT_AMOUNT || 500000);
+const FORCE_HTTPS_REDIRECT = process.env.FORCE_HTTPS_REDIRECT === 'true';
+const INCLUDE_DEBUG_RAW = process.env.INCLUDE_DEBUG_RAW === 'true';
 
-// CDEK API credentials - ДОЛЖНЫ БЫТЬ НАСТРОЕНЫ В .env
-const CDEK_API_KEY = process.env.CDEK_API_KEY;
-const CDEK_API_PASSWORD = process.env.CDEK_API_PASSWORD;
-
-// Validate API credentials
-if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
-    console.error('=== ВНИМАНИЕ: CDEK API ключи не настроены! ===');
-    console.error('Добавьте в .env файл:');
-    console.error('CDEK_API_KEY=ваш_ключ');
-    console.error('CDEK_API_PASSWORD=ваш_пароль');
-    console.error('Получите ключи на: https://api.cdek.ru/');
-    console.error('==========================================');
+function parseCsvEnv(name, fallback = '') {
+    return (process.env[name] || fallback)
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
 }
 
-// Routes
+const ALLOWED_ORIGINS = parseCsvEnv(
+    'ALLOWED_ORIGINS',
+    'http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000'
+);
+const ALLOWED_RETURN_HOSTS = parseCsvEnv('ALLOWED_RETURN_HOSTS', 'localhost,127.0.0.1');
+const YOOKASSA_WEBHOOK_IP_ALLOWLIST = new Set(parseCsvEnv('YOOKASSA_WEBHOOK_IP_ALLOWLIST'));
+const YOOKASSA_WEBHOOK_SECRET = process.env.YOOKASSA_WEBHOOK_SECRET || '';
+
+const CDEK_API_KEY = process.env.CDEK_API_KEY;
+const CDEK_API_PASSWORD = process.env.CDEK_API_PASSWORD;
+const CDEK_SENDER_CITY_CODE = Number(process.env.CDEK_SENDER_CITY_CODE || 270);
+const CDEK_SENDER_PVZ_CODE = process.env.CDEK_SENDER_PVZ_CODE || '';
+const CDEK_SENDER_ADDRESS = process.env.CDEK_SENDER_ADDRESS || 'г. Москва';
+const CDEK_DEFAULT_TARIFF_CODE = Number(process.env.CDEK_DEFAULT_TARIFF_CODE || 136);
+
+const YOOKASSA_API_URL = process.env.YOOKASSA_API_URL || 'https://api.yookassa.ru/v3';
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+
+if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
+    console.error('=== WARNING: CDEK API credentials are missing ===');
+    console.error('Set CDEK_API_KEY and CDEK_API_PASSWORD in .env');
+}
+
+function isYookassaConfigured() {
+    return Boolean(YOOKASSA_SHOP_ID && YOOKASSA_SECRET_KEY);
+}
+
+function getYookassaAuthHeader() {
+    const token = Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString('base64');
+    return `Basic ${token}`;
+}
+
+function sendError(res, status, error, message, details) {
+    const payload = { error, message };
+    if (INCLUDE_DEBUG_RAW && details) payload.details = details;
+    return res.status(status).json(payload);
+}
+
+function isValidEmail(email) {
+    if (typeof email !== 'string') return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+function isValidPhone(phone) {
+    if (typeof phone !== 'string') return false;
+    const digits = phone.replace(/\D/g, '');
+    return digits.length >= 10 && digits.length <= 15;
+}
+
+function isAllowedReturnUrl(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        if (NODE_ENV === 'production' && parsed.protocol !== 'https:') return false;
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+        return ALLOWED_RETURN_HOSTS.includes(parsed.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function getRequestIp(req) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (typeof forwardedFor === 'string' && forwardedFor.length > 0) {
+        return forwardedFor.split(',')[0].trim();
+    }
+    return req.ip || req.socket?.remoteAddress || '';
+}
+
+function isWebhookIpAllowed(req) {
+    if (YOOKASSA_WEBHOOK_IP_ALLOWLIST.size === 0) return true;
+    return YOOKASSA_WEBHOOK_IP_ALLOWLIST.has(getRequestIp(req));
+}
+
+function isWebhookSecretValid(req) {
+    if (!YOOKASSA_WEBHOOK_SECRET) return true;
+    const provided = req.headers['x-yookassa-webhook-secret'];
+    return typeof provided === 'string' && provided === YOOKASSA_WEBHOOK_SECRET;
+}
+
+app.set('trust proxy', TRUST_PROXY);
+
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    if (NODE_ENV === 'production') {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+});
+
+if (FORCE_HTTPS_REDIRECT) {
+    app.use((req, res, next) => {
+        const proto = req.headers['x-forwarded-proto'] || req.protocol;
+        if (proto !== 'https') {
+            return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+        }
+        return next();
+    });
+}
+
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        return callback(new Error('CORS: origin is not allowed'));
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotence-Key', 'x-yookassa-webhook-secret'],
+    credentials: false
+}));
+
+app.use(express.json({ limit: MAX_JSON_BODY }));
+
+const rateLimitStore = new Map();
+app.use('/api', (req, res, next) => {
+    const now = Date.now();
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${ip}:${req.path}`;
+    const current = rateLimitStore.get(key);
+
+    if (!current || current.resetAt <= now) {
+        rateLimitStore.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+        return next();
+    }
+
+    current.count += 1;
+    if (current.count > RATE_LIMIT_MAX) {
+        const retryAfterSec = Math.ceil((current.resetAt - now) / 1000);
+        res.setHeader('Retry-After', String(retryAfterSec));
+        return res.status(429).json({ error: 'Too many requests', message: 'Rate limit exceeded, try again later' });
+    }
+    return next();
+});
+
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
+    res.json({
+        status: 'OK',
         message: 'Backend is running',
         timestamp: new Date().toISOString(),
-        cdekConfigured: !!(CDEK_API_KEY && CDEK_API_PASSWORD)
+        cdekConfigured: Boolean(CDEK_API_KEY && CDEK_API_PASSWORD),
+        yookassaConfigured: isYookassaConfigured()
     });
 });
 
-// CDEK Authentication
+app.get('/api/config/public', (req, res) => {
+    res.json({
+        cdek: {
+            senderCityCode: CDEK_SENDER_CITY_CODE,
+            senderPvzCode: CDEK_SENDER_PVZ_CODE,
+            senderAddress: CDEK_SENDER_ADDRESS,
+            defaultTariffCode: CDEK_DEFAULT_TARIFF_CODE
+        },
+        payment: {
+            provider: isYookassaConfigured() ? 'yookassa' : 'demo',
+            yookassaConfigured: isYookassaConfigured()
+        }
+    });
+});
+
 app.post('/api/cdek/auth', async (req, res) => {
     try {
-        const authUrl = 'https://api.cdek.ru/v2/oauth/token';
-        
-        const authResponse = await fetch(authUrl, {
+        if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
+            return sendError(res, 503, 'Configuration error', 'CDEK credentials are not configured');
+        }
+
+        const authResponse = await fetch('https://api.cdek.ru/v2/oauth/token', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Type': 'application/x-www-form-urlencoded'
             },
             body: new URLSearchParams({
                 grant_type: 'client_credentials',
@@ -53,194 +206,116 @@ app.post('/api/cdek/auth', async (req, res) => {
 
         if (!authResponse.ok) {
             const errorText = await authResponse.text();
-            console.error('CDEK Auth Failed:', {
-                status: authResponse.status,
-                statusText: authResponse.statusText,
-                error: errorText
-            });
-            
-            return res.status(authResponse.status).json({
-                error: 'CDEK authentication failed',
-                message: errorText,
-                details: 'Check your CDEK API credentials in .env file'
-            });
+            return sendError(res, authResponse.status, 'CDEK authentication failed', 'Failed to authenticate in CDEK', errorText);
         }
 
         const authData = await authResponse.json();
-        res.json(authData);
+        return res.json(authData);
     } catch (error) {
-        console.error('CDEK Auth Error:', error);
-        res.status(500).json({ 
-            error: 'Authentication error',
-            message: error.message,
-            details: 'Network error or CDEK API is unavailable'
-        });
+        return sendError(res, 500, 'Authentication error', error.message);
     }
 });
 
-// Search cities in CDEK
 app.get('/api/cdek/cities/search', async (req, res) => {
     try {
         const { city, country_code = 'RU', size = 20 } = req.query;
-        
+
         if (!city || city.length < 2) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'City name must be at least 2 characters'
-            });
+            return sendError(res, 400, 'Invalid request', 'City name must be at least 2 characters');
         }
-        
-        // Get auth token
+
         const token = await getAuthToken();
         if (!token) {
-            return res.status(401).json({ 
-                error: 'Authentication required',
-                message: 'Unable to authenticate with CDEK API'
-            });
+            return sendError(res, 401, 'Authentication required', 'Unable to authenticate with CDEK API');
         }
-        
+
         const citiesUrl = `https://api.cdek.ru/v2/location/cities?city=${encodeURIComponent(city)}&country_codes=${country_code}&size=${size}`;
-        
         const response = await fetch(citiesUrl, {
             headers: {
-                'Authorization': `Bearer ${token}`,
+                Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json'
             }
         });
 
         if (!response.ok) {
-            console.error('Cities API Error:', {
-                status: response.status,
-                statusText: response.statusText,
-                url: citiesUrl
-            });
-            
-            if (response.status === 401) {
-                return res.status(401).json({ 
-                    error: 'Unauthorized',
-                    message: 'Invalid or expired CDEK token'
-                });
-            }
-            
-            return res.status(response.status).json({ 
-                error: 'Failed to fetch cities',
-                message: `CDEK API returned ${response.status}`
-            });
+            return sendError(res, response.status, 'Failed to fetch cities', `CDEK API returned ${response.status}`);
         }
 
-        const citiesData = await response.json();
-        res.json(citiesData);
+        return res.json(await response.json());
     } catch (error) {
-        console.error('Cities Search Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message
-        });
+        return sendError(res, 500, 'Internal server error', error.message);
     }
 });
 
-// Get PVZ for city
 app.get('/api/cdek/pvz/full', async (req, res) => {
     try {
         const { city_code, type = 'ALL', have_cashless = true, is_handout = true } = req.query;
-        
+
         if (!city_code) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'city_code parameter is required'
-            });
+            return sendError(res, 400, 'Invalid request', 'city_code parameter is required');
         }
-        
-        // Get auth token
+
         const token = await getAuthToken();
         if (!token) {
-            return res.status(401).json({ 
-                error: 'Authentication required',
-                message: 'Unable to authenticate with CDEK API'
-            });
+            return sendError(res, 401, 'Authentication required', 'Unable to authenticate with CDEK API');
         }
-        
+
         const pvzUrl = `https://api.cdek.ru/v2/deliverypoints?city_code=${city_code}&type=${type}&have_cashless=${have_cashless}&is_handout=${is_handout}`;
-        
         const response = await fetch(pvzUrl, {
             headers: {
-                'Authorization': `Bearer ${token}`,
+                Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json'
             }
         });
 
         if (!response.ok) {
-            console.error('PVZ API Error:', {
-                status: response.status,
-                statusText: response.statusText,
-                url: pvzUrl
-            });
-            
-            if (response.status === 401) {
-                return res.status(401).json({ 
-                    error: 'Unauthorized',
-                    message: 'Invalid or expired CDEK token'
-                });
-            }
-            
-            return res.status(response.status).json({ 
-                error: 'Failed to fetch PVZ',
-                message: `CDEK API returned ${response.status}`
-            });
+            return sendError(res, response.status, 'Failed to fetch PVZ', `CDEK API returned ${response.status}`);
         }
 
-        const pvzData = await response.json();
-        res.json(pvzData);
+        return res.json(await response.json());
     } catch (error) {
-        console.error('PVZ Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message
-        });
+        return sendError(res, 500, 'Internal server error', error.message);
     }
 });
 
-// Calculate delivery cost
 app.post('/api/cdek/calculate', async (req, res) => {
     try {
-        const { from_location, to_location, tariff_code = 136, packages } = req.body;
-        
+        const {
+            from_location,
+            to_location,
+            to_pvz_code,
+            delivery_mode = 3,
+            preferred_tariff_codes = [CDEK_DEFAULT_TARIFF_CODE],
+            packages
+        } = req.body;
+
         if (!to_location || !to_location.code) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'to_location with code is required'
-            });
+            return sendError(res, 400, 'Invalid request', 'to_location with code is required');
         }
-        
+
         if (!packages || !Array.isArray(packages) || packages.length === 0) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'At least one package is required'
-            });
+            return sendError(res, 400, 'Invalid request', 'At least one package is required');
         }
-        
-        // Get auth token
+
         const token = await getAuthToken();
         if (!token) {
-            return res.status(401).json({ 
-                error: 'Authentication required',
-                message: 'Unable to authenticate with CDEK API'
-            });
+            return sendError(res, 401, 'Authentication required', 'Unable to authenticate with CDEK API');
         }
-        
-        const calculateUrl = 'https://api.cdek.ru/v2/calculator/tarifflist';
-        
+
         const requestData = {
-            from_location: from_location || { code: 270 }, // Москва по умолчанию
-            to_location: to_location,
-            packages: packages,
+            from_location: from_location || {
+                code: CDEK_SENDER_CITY_CODE,
+                address: CDEK_SENDER_ADDRESS
+            },
+            to_location,
+            packages,
             services: []
         };
-        
-        const response = await fetch(calculateUrl, {
+
+        const response = await fetch('https://api.cdek.ru/v2/calculator/tarifflist', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${token}`,
+                Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify(requestData)
@@ -248,53 +323,53 @@ app.post('/api/cdek/calculate', async (req, res) => {
 
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('Calculate API Error:', {
-                status: response.status,
-                statusText: response.statusText,
-                error: errorText,
-                requestData: requestData
-            });
-            
-            if (response.status === 401) {
-                return res.status(401).json({ 
-                    error: 'Unauthorized',
-                    message: 'Invalid or expired CDEK token'
-                });
-            }
-            
-            return res.status(response.status).json({ 
-                error: 'Failed to calculate delivery',
-                message: `CDEK API returned ${response.status}`,
-                details: errorText
-            });
+            return sendError(res, response.status, 'Failed to calculate delivery', `CDEK API returned ${response.status}`, errorText);
         }
 
         const data = await response.json();
-        res.json(data);
-    } catch (error) {
-        console.error('Calculate Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message
+        const tariffs = Array.isArray(data?.tariff_codes) ? data.tariff_codes : (Array.isArray(data) ? data : []);
+
+        const preferredSet = new Set((preferred_tariff_codes || []).map(Number));
+        let selectedTariff = tariffs.find((t) => preferredSet.has(Number(t.tariff_code))) || null;
+
+        if (!selectedTariff) {
+            selectedTariff = tariffs.find((t) => Number(t.delivery_mode) === Number(delivery_mode)) || null;
+        }
+
+        if (!selectedTariff && tariffs.length) {
+            selectedTariff = tariffs[0];
+        }
+
+        return res.json({
+            selected_tariff: selectedTariff,
+            tariff_codes: tariffs,
+            debug: {
+                sender_city_code: requestData.from_location?.code,
+                sender_pvz_code: CDEK_SENDER_PVZ_CODE || null,
+                receiver_city_code: requestData.to_location?.code,
+                receiver_pvz_code: to_pvz_code || null
+            }
         });
+    } catch (error) {
+        return sendError(res, 500, 'Internal server error', error.message);
     }
 });
 
-// Create CDEK order
 app.post('/api/cdek/order/create', async (req, res) => {
     try {
-        const orderData = req.body;
-        
+        const orderData = { ...req.body };
+        orderData.from_location = orderData.from_location || {
+            code: CDEK_SENDER_CITY_CODE,
+            address: CDEK_SENDER_ADDRESS
+        };
+        orderData.tariff_code = orderData.tariff_code || CDEK_DEFAULT_TARIFF_CODE;
+
         if (!orderData || !orderData.recipient || !orderData.to_location || !orderData.packages) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'Missing required order data'
-            });
+            return sendError(res, 400, 'Invalid request', 'Missing required order data');
         }
-        
-        // Validate required fields
+
         const requiredFields = ['number', 'tariff_code', 'recipient.name', 'recipient.phones', 'to_location.code'];
-        const missingFields = requiredFields.filter(field => {
+        const missingFields = requiredFields.filter((field) => {
             const parts = field.split('.');
             let value = orderData;
             for (const part of parts) {
@@ -303,30 +378,20 @@ app.post('/api/cdek/order/create', async (req, res) => {
             }
             return false;
         });
-        
+
         if (missingFields.length > 0) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'Missing required fields',
-                missingFields: missingFields
-            });
+            return res.status(400).json({ error: 'Invalid request', message: 'Missing required fields', missingFields });
         }
-        
-        // Get auth token
+
         const token = await getAuthToken();
         if (!token) {
-            return res.status(401).json({ 
-                error: 'Authentication required',
-                message: 'Unable to authenticate with CDEK API'
-            });
+            return sendError(res, 401, 'Authentication required', 'Unable to authenticate with CDEK API');
         }
-        
-        const orderUrl = 'https://api.cdek.ru/v2/orders';
-        
-        const response = await fetch(orderUrl, {
+
+        const response = await fetch('https://api.cdek.ru/v2/orders', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${token}`,
+                Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify(orderData)
@@ -334,183 +399,231 @@ app.post('/api/cdek/order/create', async (req, res) => {
 
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('Order Creation Error:', {
-                status: response.status,
-                statusText: response.statusText,
-                error: errorText,
-                orderData: orderData
-            });
-            
-            if (response.status === 401) {
-                return res.status(401).json({ 
-                    error: 'Unauthorized',
-                    message: 'Invalid or expired CDEK token'
-                });
-            }
-            
-            return res.status(response.status).json({ 
-                error: 'Failed to create order',
-                message: `CDEK API returned ${response.status}`,
-                details: errorText
-            });
+            return sendError(res, response.status, 'Failed to create order', `CDEK API returned ${response.status}`, errorText);
         }
 
-        const orderResponse = await response.json();
-        res.json(orderResponse);
+        return res.json(await response.json());
     } catch (error) {
-        console.error('Order Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message
-        });
+        return sendError(res, 500, 'Internal server error', error.message);
     }
 });
 
-// Get order status
 app.get('/api/cdek/order/:uuid/status', async (req, res) => {
     try {
         const { uuid } = req.params;
-        
+
         if (!uuid) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'Order UUID is required'
-            });
+            return sendError(res, 400, 'Invalid request', 'Order UUID is required');
         }
-        
-        // Get auth token
+
         const token = await getAuthToken();
         if (!token) {
-            return res.status(401).json({ 
-                error: 'Authentication required',
-                message: 'Unable to authenticate with CDEK API'
-            });
+            return sendError(res, 401, 'Authentication required', 'Unable to authenticate with CDEK API');
         }
-        
-        const statusUrl = `https://api.cdek.ru/v2/orders/${uuid}`;
-        
-        const response = await fetch(statusUrl, {
+
+        const response = await fetch(`https://api.cdek.ru/v2/orders/${uuid}`, {
             headers: {
-                'Authorization': `Bearer ${token}`,
+                Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json'
             }
         });
 
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('Order Status Error:', {
-                status: response.status,
-                statusText: response.statusText,
-                error: errorText,
-                uuid: uuid
-            });
-            
-            if (response.status === 401) {
-                return res.status(401).json({ 
-                    error: 'Unauthorized',
-                    message: 'Invalid or expired CDEK token'
-                });
-            }
-            
-            if (response.status === 404) {
-                return res.status(404).json({ 
-                    error: 'Order not found',
-                    message: 'Order with specified UUID not found'
-                });
-            }
-            
-            return res.status(response.status).json({ 
-                error: 'Failed to get order status',
-                message: `CDEK API returned ${response.status}`,
-                details: errorText
-            });
+            return sendError(res, response.status, 'Failed to get order status', `CDEK API returned ${response.status}`, errorText);
         }
 
-        const statusData = await response.json();
-        res.json(statusData);
+        return res.json(await response.json());
     } catch (error) {
-        console.error('Status Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message
-        });
+        return sendError(res, 500, 'Internal server error', error.message);
     }
 });
 
-// Payment initialization
-app.post('/api/payment/init', async (req, res) => {
+app.post('/api/payment/create', async (req, res) => {
     try {
-        const { orderId, amount, customer, items, description } = req.body;
-        
-        if (!orderId || !amount || !customer) {
-            return res.status(400).json({ 
-                error: 'Invalid request',
-                message: 'Missing required payment data'
-            });
-        }
-        
-        // Здесь должна быть интеграция с реальным платежным шлюзом
-        // Например: Тинькофф, ЮKassa, CloudPayments
-        
-        // Временно возвращаем успешный ответ для тестирования
-        res.json({
-            Success: true,
-            PaymentURL: null, // URL для редиректа на платежную страницу
-            PaymentId: `pmt_${Date.now()}`,
-            Message: 'Payment initialized successfully',
-            OrderId: orderId,
-            Amount: amount
-        });
-    } catch (error) {
-        console.error('Payment Init Error:', error);
-        res.status(500).json({ 
-            Success: false,
-            Message: 'Payment initialization failed',
-            Error: error.message
-        });
-    }
-});
+        const { orderId, amount, customer, description, returnUrl } = req.body;
 
-// Process payment
-app.post('/api/payment/process', async (req, res) => {
-    try {
-        const { orderId, amount, card } = req.body;
-        
-        if (!orderId || !amount || !card) {
-            return res.status(400).json({ 
+        if (!orderId || !amount || !customer || !returnUrl) {
+            return sendError(res, 400, 'Invalid request', 'Missing required payment data: orderId, amount, customer, returnUrl');
+        }
+
+        if (!Number.isFinite(Number(amount)) || Number(amount) <= 0 || Number(amount) > MAX_PAYMENT_AMOUNT) {
+            return sendError(res, 400, 'Invalid request', `Amount must be > 0 and <= ${MAX_PAYMENT_AMOUNT}`);
+        }
+
+        if (!customer?.email || !isValidEmail(customer.email)) {
+            return sendError(res, 400, 'Invalid request', 'Customer email is invalid');
+        }
+
+        if (customer?.phone && !isValidPhone(customer.phone)) {
+            return sendError(res, 400, 'Invalid request', 'Customer phone is invalid');
+        }
+
+        if (!isAllowedReturnUrl(returnUrl)) {
+            return sendError(res, 400, 'Invalid request', 'returnUrl is not allowed');
+        }
+
+        if (!isYookassaConfigured()) {
+            return res.status(503).json({
                 Success: false,
-                Message: 'Missing required payment data'
+                Message: 'YooKassa is not configured',
+                Details: 'Set YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY in .env'
             });
         }
-        
-        // Здесь должна быть обработка реального платежа
-        // Временная симуляция успешного платежа
-        
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        res.json({
+
+        const payload = {
+            amount: {
+                value: Number(amount).toFixed(2),
+                currency: 'RUB'
+            },
+            payment_method_data: {
+                type: 'bank_card'
+            },
+            confirmation: {
+                type: 'redirect',
+                return_url: returnUrl
+            },
+            capture: true,
+            description: description || `Оплата заказа ${orderId}`,
+            metadata: {
+                order_id: String(orderId),
+                customer_email: String(customer.email || '')
+            }
+        };
+
+        const paymentResponse = await fetch(`${YOOKASSA_API_URL}/payments`, {
+            method: 'POST',
+            headers: {
+                Authorization: getYookassaAuthHeader(),
+                'Idempotence-Key': crypto.randomUUID(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+
+        const paymentData = await paymentResponse.json();
+
+        if (!paymentResponse.ok) {
+            return res.status(paymentResponse.status).json({
+                Success: false,
+                Message: 'Failed to create YooKassa payment',
+                ...(INCLUDE_DEBUG_RAW ? { Details: paymentData } : {})
+            });
+        }
+
+        return res.json({
             Success: true,
-            TransactionId: `txn_${Date.now()}`,
-            Amount: amount,
-            Message: 'Payment processed successfully',
-            OrderId: orderId,
-            Timestamp: new Date().toISOString()
+            provider: 'yookassa',
+            paymentId: paymentData.id,
+            status: paymentData.status,
+            confirmationUrl: paymentData.confirmation?.confirmation_url || null,
+            paid: Boolean(paymentData.paid)
         });
     } catch (error) {
-        console.error('Payment Process Error:', error);
-        res.status(500).json({ 
-            Success: false,
-            Message: 'Payment processing failed',
-            Error: error.message
-        });
+        return sendError(res, 500, 'Payment initialization failed', error.message);
     }
 });
 
-// Send order notifications
+app.get('/api/payment/status/:paymentId', async (req, res) => {
+    try {
+        if (!isYookassaConfigured()) {
+            return res.status(503).json({ Success: false, Message: 'YooKassa is not configured' });
+        }
+
+        const { paymentId } = req.params;
+        if (!paymentId) {
+            return res.status(400).json({ Success: false, Message: 'paymentId is required' });
+        }
+
+        const response = await fetch(`${YOOKASSA_API_URL}/payments/${encodeURIComponent(paymentId)}`, {
+            method: 'GET',
+            headers: {
+                Authorization: getYookassaAuthHeader(),
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const paymentData = await response.json();
+        if (!response.ok) {
+            return res.status(response.status).json({
+                Success: false,
+                Message: 'Failed to fetch payment status',
+                ...(INCLUDE_DEBUG_RAW ? { Details: paymentData } : {})
+            });
+        }
+
+        return res.json({
+            Success: true,
+            provider: 'yookassa',
+            paymentId: paymentData.id,
+            status: paymentData.status,
+            paid: Boolean(paymentData.paid),
+            amount: paymentData.amount,
+            metadata: paymentData.metadata || {}
+        });
+    } catch (error) {
+        return sendError(res, 500, 'Payment status failed', error.message);
+    }
+});
+
+app.post('/api/payment/webhook/yookassa', async (req, res) => {
+    try {
+        if (!isYookassaConfigured()) {
+            return res.status(503).json({ received: false, message: 'YooKassa is not configured' });
+        }
+
+        if (!isWebhookIpAllowed(req)) {
+            return res.status(403).json({ received: false, message: 'Webhook IP is not allowed' });
+        }
+
+        if (!isWebhookSecretValid(req)) {
+            return res.status(403).json({ received: false, message: 'Webhook secret is invalid' });
+        }
+
+        const event = req.body?.event;
+        const object = req.body?.object;
+        const allowedEvents = new Set(['payment.succeeded', 'payment.waiting_for_capture', 'payment.canceled']);
+        if (!allowedEvents.has(event) || !object?.id) {
+            return res.status(400).json({ received: false, message: 'Unexpected webhook payload' });
+        }
+
+        const verifyResponse = await fetch(`${YOOKASSA_API_URL}/payments/${encodeURIComponent(object.id)}`, {
+            method: 'GET',
+            headers: {
+                Authorization: getYookassaAuthHeader(),
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const verifiedPayment = await verifyResponse.json();
+        if (!verifyResponse.ok) {
+            return res.status(502).json({ received: false, message: 'Failed to verify payment with YooKassa' });
+        }
+
+        if (verifiedPayment.id !== object.id || verifiedPayment.status !== object.status) {
+            return res.status(400).json({ received: false, message: 'Webhook payload does not match YooKassa state' });
+        }
+
+        console.log('YooKassa webhook:', {
+            event,
+            paymentId: verifiedPayment.id,
+            status: verifiedPayment.status,
+            orderId: verifiedPayment?.metadata?.order_id
+        });
+
+        return res.status(200).json({ received: true });
+    } catch (error) {
+        return sendError(res, 500, 'Webhook processing failed', error.message);
+    }
+});
+
 app.post('/api/notify/order', async (req, res) => {
     try {
         const order = req.body;
-        
+        if (!order?.id || !order?.customer?.email || !isValidEmail(order.customer.email)) {
+            return sendError(res, 400, 'Invalid request', 'Order id and valid customer email are required');
+        }
+
         console.log('Order notification received:', {
             orderId: order.id,
             customer: order.customer?.name,
@@ -520,77 +633,53 @@ app.post('/api/notify/order', async (req, res) => {
             delivery: order.delivery?.city?.name,
             timestamp: new Date().toISOString()
         });
-        
-        // Здесь должна быть отправка email/SMS через сервис
-        // Например: SendGrid, Mailgun, Twilio
-        
-        res.json({ 
-            success: true, 
-            message: 'Notification logged',
-            orderId: order.id,
-            timestamp: new Date().toISOString()
-        });
+
+        return res.json({ success: true, message: 'Notification logged', orderId: order.id, timestamp: new Date().toISOString() });
     } catch (error) {
-        console.error('Notification Error:', error);
-        res.status(500).json({ 
-            success: false,
-            error: 'Failed to send notification',
-            message: error.message
-        });
+        return sendError(res, 500, 'Failed to send notification', error.message);
     }
 });
 
-// Send payment notifications
 app.post('/api/notify/payment', async (req, res) => {
     try {
         const { orderId, amount, customer, paymentMethod } = req.body;
-        
+        if (!orderId || !Number.isFinite(Number(amount))) {
+            return sendError(res, 400, 'Invalid request', 'orderId and amount are required');
+        }
+
         console.log('Payment notification received:', {
-            orderId: orderId,
-            amount: amount,
+            orderId,
+            amount,
             customer: customer?.name,
-            paymentMethod: paymentMethod,
+            paymentMethod,
             timestamp: new Date().toISOString()
         });
-        
-        // Здесь должна быть отправка уведомления о платеже
-        
-        res.json({ 
-            success: true, 
-            message: 'Payment notification logged',
-            orderId: orderId,
-            timestamp: new Date().toISOString()
-        });
+
+        return res.json({ success: true, message: 'Payment notification logged', orderId, timestamp: new Date().toISOString() });
     } catch (error) {
-        console.error('Payment Notification Error:', error);
-        res.status(500).json({ 
-            success: false,
-            error: 'Failed to send payment notification',
-            message: error.message
-        });
+        return sendError(res, 500, 'Failed to send payment notification', error.message);
     }
 });
 
-// Cache for auth token
 let authTokenCache = {
     token: null,
     expiresAt: 0
 };
 
-// Helper function to get auth token with caching
 async function getAuthToken() {
     try {
-        // Check if cached token is still valid (expires in 5 minutes)
+        if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
+            return null;
+        }
+
         if (authTokenCache.token && authTokenCache.expiresAt > Date.now() + 300000) {
             return authTokenCache.token;
         }
-        
-        const authUrl = 'https://api.cdek.ru/v2/oauth/token';
-        
-        const authResponse = await fetch(authUrl, {
+
+        const authResponse = await fetch('https://api.cdek.ru/v2/oauth/token', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Type': 'application/x-www-form-urlencoded'
             },
             body: new URLSearchParams({
                 grant_type: 'client_credentials',
@@ -600,62 +689,38 @@ async function getAuthToken() {
         });
 
         if (!authResponse.ok) {
-            console.error('Failed to get auth token:', {
-                status: authResponse.status,
-                statusText: authResponse.statusText
-            });
             return null;
         }
 
         const authData = await authResponse.json();
-        
-        // Cache the token
         authTokenCache = {
             token: authData.access_token,
             expiresAt: Date.now() + (authData.expires_in * 1000)
         };
-        
-        console.log('New CDEK token obtained, expires in:', authData.expires_in, 'seconds');
-        
+
         return authData.access_token;
-    } catch (error) {
-        console.error('Error getting auth token:', error);
+    } catch {
         return null;
     }
 }
 
-// Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
-    res.status(500).json({
-        error: 'Internal server error',
-        message: 'An unexpected error occurred'
-    });
+    return sendError(res, 500, 'Internal server error', 'An unexpected error occurred');
 });
 
-// 404 handler
 app.use((req, res) => {
-    res.status(404).json({
-        error: 'Not found',
-        message: `Route ${req.method} ${req.path} not found`
-    });
+    return sendError(res, 404, 'Not found', `Route ${req.method} ${req.path} not found`);
 });
 
-// Start server
 app.listen(PORT, () => {
-    console.log('=== Illusive Store Backend (БОЕВОЙ РЕЖИМ) ===');
+    console.log('=== Illusive Store Backend ===');
     console.log(`Server is running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
-    console.log(`CDEK API configured: ${CDEK_API_KEY ? 'YES' : 'NO (add credentials to .env)'}`);
-    if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
-        console.log('\n=== ВНИМАНИЕ ===');
-        console.log('Для работы с СДЭК необходимо:');
-        console.log('1. Получить API ключи на https://api.cdek.ru/');
-        console.log('2. Создать файл .env в корне проекта');
-        console.log('3. Добавить в .env:');
-        console.log('   CDEK_API_KEY=your_client_id');
-        console.log('   CDEK_API_PASSWORD=your_client_secret');
-        console.log('================\n');
-    }
+    console.log(`NODE_ENV: ${NODE_ENV}`);
+    console.log(`CDEK API configured: ${CDEK_API_KEY ? 'YES' : 'NO'}`);
+    console.log(`YooKassa configured: ${isYookassaConfigured() ? 'YES' : 'NO'}`);
+    console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+    console.log(`Allowed return hosts: ${ALLOWED_RETURN_HOSTS.join(', ')}`);
     console.log('============================================');
 });
