@@ -274,7 +274,7 @@ app.use(cors({
         if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
         return callback(new Error('CORS: origin is not allowed'));
     },
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Idempotence-Key', 'x-yookassa-webhook-secret'],
     credentials: false
 }));
