@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs/promises');
 require('dotenv').config();
 
 const app = express();
@@ -41,6 +43,14 @@ const CDEK_DEFAULT_TARIFF_CODE = Number(process.env.CDEK_DEFAULT_TARIFF_CODE || 
 const YOOKASSA_API_URL = process.env.YOOKASSA_API_URL || 'https://api.yookassa.ru/v3';
 const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
 const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+const ADMIN_LOGIN = process.env.ADMIN_LOGIN || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+const ADMIN_TOKEN_TTL_MS = Number(process.env.ADMIN_TOKEN_TTL_MS || 1000 * 60 * 60 * 12);
+const PRODUCTS_FILE_PATH = process.env.PRODUCTS_FILE_PATH || path.join(__dirname, 'data', 'products.json');
+const ADMIN_LOGIN_WINDOW_MS = Number(process.env.ADMIN_LOGIN_WINDOW_MS || 1000 * 60 * 15);
+const ADMIN_LOGIN_MAX_ATTEMPTS = Number(process.env.ADMIN_LOGIN_MAX_ATTEMPTS || 10);
+const ADMIN_BLOCK_MS = Number(process.env.ADMIN_BLOCK_MS || 1000 * 60 * 30);
 
 if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
     console.error('=== WARNING: CDEK API credentials are missing ===');
@@ -101,6 +111,137 @@ function isWebhookSecretValid(req) {
     if (!YOOKASSA_WEBHOOK_SECRET) return true;
     const provided = req.headers['x-yookassa-webhook-secret'];
     return typeof provided === 'string' && provided === YOOKASSA_WEBHOOK_SECRET;
+}
+
+function hashValue(value) {
+    return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+function isAdminConfigured() {
+    return Boolean(ADMIN_LOGIN && (ADMIN_PASSWORD || ADMIN_PASSWORD_HASH));
+}
+
+const adminSessions = new Map();
+const adminLoginAttempts = new Map();
+
+function cleanupExpiredAdminSessions() {
+    const now = Date.now();
+    for (const [token, session] of adminSessions.entries()) {
+        if (!session || session.expiresAt <= now) {
+            adminSessions.delete(token);
+        }
+    }
+}
+
+function verifyAdminCredentials(login, password) {
+    if (!isAdminConfigured()) return false;
+    if (String(login || '').trim() !== ADMIN_LOGIN) return false;
+
+    const pass = String(password || '');
+    if (ADMIN_PASSWORD_HASH) {
+        return hashValue(pass) === ADMIN_PASSWORD_HASH;
+    }
+    return pass === ADMIN_PASSWORD;
+}
+
+function normalizeProductPayload(payload = {}, current = null) {
+    const rawImages = Array.isArray(payload.images) ? payload.images : [];
+    const normalizedImages = rawImages.map((v) => String(v || '').trim()).filter(Boolean);
+    const image = String(payload.image || '').trim() || normalizedImages[0] || current?.image || '';
+
+    const normalized = {
+        id: current?.id,
+        name: String(payload.name || current?.name || '').trim(),
+        price: Number(payload.price ?? current?.price ?? NaN),
+        image,
+        images: normalizedImages.length ? normalizedImages : (image ? [image] : []),
+        description: String(payload.description || current?.description || '').trim()
+    };
+
+    if (!normalized.name) return { error: 'Product name is required' };
+    if (!Number.isFinite(normalized.price) || normalized.price <= 0) return { error: 'Product price must be a positive number' };
+    if (!normalized.image) return { error: 'Product image is required' };
+    if (!normalized.description) return { error: 'Product description is required' };
+    return { value: normalized };
+}
+
+async function ensureProductsFileExists() {
+    try {
+        await fs.access(PRODUCTS_FILE_PATH);
+    } catch {
+        const dir = path.dirname(PRODUCTS_FILE_PATH);
+        await fs.mkdir(dir, { recursive: true });
+        const defaultProducts = [
+            {
+                id: 1,
+                name: 'vendeta t-shirt',
+                price: 2499,
+                image: 'images/products/front.jpg',
+                images: ['images/products/front.jpg', 'images/products/back.jpg'],
+                description: 'Оверсайз футболка из кулирной глади премиального качества (хлопок 94%, лайкра 6%)'
+            }
+        ];
+        await fs.writeFile(PRODUCTS_FILE_PATH, JSON.stringify(defaultProducts, null, 2), 'utf8');
+    }
+}
+
+async function readProducts() {
+    await ensureProductsFileExists();
+    const raw = await fs.readFile(PRODUCTS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+}
+
+async function writeProducts(items) {
+    const normalizedItems = Array.isArray(items) ? items : [];
+    await fs.writeFile(PRODUCTS_FILE_PATH, JSON.stringify(normalizedItems, null, 2), 'utf8');
+}
+
+function requireAdminAuth(req, res, next) {
+    cleanupExpiredAdminSessions();
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    if (!token) {
+        return sendError(res, 401, 'Unauthorized', 'Admin token is required');
+    }
+    const session = adminSessions.get(token);
+    if (!session || session.expiresAt <= Date.now()) {
+        adminSessions.delete(token);
+        return sendError(res, 401, 'Unauthorized', 'Admin session is expired or invalid');
+    }
+    req.admin = session;
+    return next();
+}
+
+function checkAdminLoginRateLimit(req) {
+    const now = Date.now();
+    const ip = getRequestIp(req) || 'unknown';
+    const current = adminLoginAttempts.get(ip) || { count: 0, resetAt: now + ADMIN_LOGIN_WINDOW_MS, blockedUntil: 0 };
+
+    if (current.blockedUntil > now) {
+        return { blocked: true, retryAfterMs: current.blockedUntil - now };
+    }
+
+    if (current.resetAt <= now) {
+        current.count = 0;
+        current.resetAt = now + ADMIN_LOGIN_WINDOW_MS;
+    }
+
+    return { blocked: false, ip, current };
+}
+
+function registerAdminLoginAttempt(ip, current, success) {
+    if (success) {
+        adminLoginAttempts.delete(ip);
+        return;
+    }
+
+    current.count += 1;
+    if (current.count >= ADMIN_LOGIN_MAX_ATTEMPTS) {
+        current.blockedUntil = Date.now() + ADMIN_BLOCK_MS;
+    }
+    adminLoginAttempts.set(ip, current);
 }
 
 app.set('trust proxy', TRUST_PROXY);
@@ -184,6 +325,135 @@ app.get('/api/config/public', (req, res) => {
             yookassaConfigured: isYookassaConfigured()
         }
     });
+});
+
+app.get('/api/products', async (req, res) => {
+    try {
+        const products = await readProducts();
+        return res.json(products);
+    } catch (error) {
+        return sendError(res, 500, 'Products read failed', error.message);
+    }
+});
+
+app.post('/api/admin/login', (req, res) => {
+    const { login, password } = req.body || {};
+    const limitState = checkAdminLoginRateLimit(req);
+
+    if (!isAdminConfigured()) {
+        return sendError(res, 503, 'Configuration error', 'Admin login is not configured on server');
+    }
+
+    if (limitState.blocked) {
+        const retryAfterSec = Math.ceil(limitState.retryAfterMs / 1000);
+        res.setHeader('Retry-After', String(retryAfterSec));
+        return sendError(res, 429, 'Too many attempts', 'Too many admin login attempts. Try again later');
+    }
+
+    const success = verifyAdminCredentials(login, password);
+    registerAdminLoginAttempt(limitState.ip, limitState.current, success);
+
+    if (!success) {
+        return sendError(res, 401, 'Unauthorized', 'Invalid admin credentials');
+    }
+
+    cleanupExpiredAdminSessions();
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + ADMIN_TOKEN_TTL_MS;
+    adminSessions.set(token, { login: ADMIN_LOGIN, createdAt: Date.now(), expiresAt });
+
+    return res.json({
+        success: true,
+        token,
+        expiresAt
+    });
+});
+
+app.get('/api/admin/session', requireAdminAuth, (req, res) => {
+    return res.json({
+        success: true,
+        login: req.admin.login,
+        expiresAt: req.admin.expiresAt
+    });
+});
+
+app.post('/api/admin/logout', requireAdminAuth, (req, res) => {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    if (token) adminSessions.delete(token);
+    return res.json({ success: true });
+});
+
+app.get('/api/admin/products', requireAdminAuth, async (req, res) => {
+    try {
+        return res.json(await readProducts());
+    } catch (error) {
+        return sendError(res, 500, 'Products read failed', error.message);
+    }
+});
+
+app.post('/api/admin/products', requireAdminAuth, async (req, res) => {
+    try {
+        const products = await readProducts();
+        const normalized = normalizeProductPayload(req.body);
+        if (normalized.error) {
+            return sendError(res, 400, 'Validation error', normalized.error);
+        }
+
+        const nextId = products.reduce((maxId, item) => Math.max(maxId, Number(item.id) || 0), 0) + 1;
+        const newProduct = { ...normalized.value, id: nextId };
+        products.push(newProduct);
+        await writeProducts(products);
+        return res.status(201).json(newProduct);
+    } catch (error) {
+        return sendError(res, 500, 'Product create failed', error.message);
+    }
+});
+
+app.put('/api/admin/products/:id', requireAdminAuth, async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return sendError(res, 400, 'Invalid request', 'Product id must be a number');
+        }
+
+        const products = await readProducts();
+        const index = products.findIndex((item) => Number(item.id) === id);
+        if (index === -1) {
+            return sendError(res, 404, 'Not found', 'Product is not found');
+        }
+
+        const normalized = normalizeProductPayload(req.body, products[index]);
+        if (normalized.error) {
+            return sendError(res, 400, 'Validation error', normalized.error);
+        }
+
+        products[index] = { ...normalized.value, id };
+        await writeProducts(products);
+        return res.json(products[index]);
+    } catch (error) {
+        return sendError(res, 500, 'Product update failed', error.message);
+    }
+});
+
+app.delete('/api/admin/products/:id', requireAdminAuth, async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return sendError(res, 400, 'Invalid request', 'Product id must be a number');
+        }
+
+        const products = await readProducts();
+        const nextProducts = products.filter((item) => Number(item.id) !== id);
+        if (nextProducts.length === products.length) {
+            return sendError(res, 404, 'Not found', 'Product is not found');
+        }
+
+        await writeProducts(nextProducts);
+        return res.json({ success: true });
+    } catch (error) {
+        return sendError(res, 500, 'Product delete failed', error.message);
+    }
 });
 
 app.post('/api/cdek/auth', async (req, res) => {
@@ -720,7 +990,13 @@ app.listen(PORT, () => {
     console.log(`NODE_ENV: ${NODE_ENV}`);
     console.log(`CDEK API configured: ${CDEK_API_KEY ? 'YES' : 'NO'}`);
     console.log(`YooKassa configured: ${isYookassaConfigured() ? 'YES' : 'NO'}`);
+    console.log(`Admin panel configured: ${isAdminConfigured() ? 'YES' : 'NO'}`);
+    console.log(`Admin login protection: max ${ADMIN_LOGIN_MAX_ATTEMPTS} attempts per ${ADMIN_LOGIN_WINDOW_MS}ms, block ${ADMIN_BLOCK_MS}ms`);
+    console.log(`Products file: ${PRODUCTS_FILE_PATH}`);
     console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
     console.log(`Allowed return hosts: ${ALLOWED_RETURN_HOSTS.join(', ')}`);
     console.log('============================================');
 });
+
+
+
