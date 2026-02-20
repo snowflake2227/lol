@@ -343,8 +343,19 @@ function buildCdekOrderFromStoredOrder(order) {
         }
     };
 
-    if (CDEK_SENDER_PVZ_CODE) payload.shipment_point = CDEK_SENDER_PVZ_CODE;
-    if (order.delivery?.pvz?.code) payload.delivery_point = order.delivery.pvz.code;
+    // CDEK validation: do not send address together with PVZ point code.
+    if (CDEK_SENDER_PVZ_CODE) {
+        payload.shipment_point = CDEK_SENDER_PVZ_CODE;
+        if (payload.from_location && 'address' in payload.from_location) {
+            delete payload.from_location.address;
+        }
+    }
+    if (order.delivery?.pvz?.code) {
+        payload.delivery_point = order.delivery.pvz.code;
+        if (payload.to_location && 'address' in payload.to_location) {
+            delete payload.to_location.address;
+        }
+    }
 
     return payload;
 }
