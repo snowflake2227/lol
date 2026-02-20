@@ -51,6 +51,11 @@ const PRODUCTS_FILE_PATH = process.env.PRODUCTS_FILE_PATH || path.join(__dirname
 const ADMIN_LOGIN_WINDOW_MS = Number(process.env.ADMIN_LOGIN_WINDOW_MS || 1000 * 60 * 15);
 const ADMIN_LOGIN_MAX_ATTEMPTS = Number(process.env.ADMIN_LOGIN_MAX_ATTEMPTS || 10);
 const ADMIN_BLOCK_MS = Number(process.env.ADMIN_BLOCK_MS || 1000 * 60 * 30);
+const ORDERS_FILE_PATH = process.env.ORDERS_FILE_PATH || path.join(__dirname, 'data', 'orders.json');
+const CDEK_SENDER_COMPANY = process.env.CDEK_SENDER_COMPANY || 'Illusive Store';
+const CDEK_SENDER_NAME = process.env.CDEK_SENDER_NAME || 'Администратор магазина';
+const CDEK_SENDER_EMAIL = process.env.CDEK_SENDER_EMAIL || '';
+const CDEK_SENDER_PHONE = process.env.CDEK_SENDER_PHONE || '';
 
 if (!CDEK_API_KEY || !CDEK_API_PASSWORD) {
     console.error('=== WARNING: CDEK API credentials are missing ===');
@@ -196,6 +201,212 @@ async function readProducts() {
 async function writeProducts(items) {
     const normalizedItems = Array.isArray(items) ? items : [];
     await fs.writeFile(PRODUCTS_FILE_PATH, JSON.stringify(normalizedItems, null, 2), 'utf8');
+}
+
+function sanitizePhoneForCdek(phone) {
+    const raw = String(phone || '');
+    if (raw.startsWith('+')) {
+        return `+${raw.slice(1).replace(/\D/g, '')}`;
+    }
+    const digits = raw.replace(/\D/g, '');
+    return digits ? `+${digits}` : '';
+}
+
+function toPositiveNumber(value, fallback = 0) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return fallback;
+    return num;
+}
+
+async function ensureOrdersFileExists() {
+    try {
+        await fs.access(ORDERS_FILE_PATH);
+    } catch {
+        const dir = path.dirname(ORDERS_FILE_PATH);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(ORDERS_FILE_PATH, '{}', 'utf8');
+    }
+}
+
+async function readOrdersStore() {
+    await ensureOrdersFileExists();
+    const raw = await fs.readFile(ORDERS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+}
+
+async function writeOrdersStore(store) {
+    const normalized = (store && typeof store === 'object' && !Array.isArray(store)) ? store : {};
+    await fs.writeFile(ORDERS_FILE_PATH, JSON.stringify(normalized, null, 2), 'utf8');
+}
+
+function normalizeIncomingOrder(raw = {}) {
+    const orderId = String(raw.id || raw.number || '').trim();
+    if (!orderId) return { error: 'Order id is required' };
+
+    const customerName = String(raw.customer?.name || '').trim();
+    const customerEmail = String(raw.customer?.email || '').trim();
+    const customerPhone = sanitizePhoneForCdek(raw.customer?.phone);
+
+    if (!customerName) return { error: 'Customer name is required' };
+    if (!isValidEmail(customerEmail)) return { error: 'Valid customer email is required' };
+    if (!isValidPhone(customerPhone)) return { error: 'Valid customer phone is required' };
+
+    const cityCode = Number(raw.delivery?.city?.code);
+    const cityName = String(raw.delivery?.city?.name || '').trim();
+    const pvzCode = String(raw.delivery?.pvz?.code || '').trim();
+    const pvzName = String(raw.delivery?.pvz?.name || '').trim();
+    const pvzAddress = String(raw.delivery?.pvz?.address || '').trim();
+
+    if (!Number.isFinite(cityCode)) return { error: 'Delivery city code is required' };
+    if (!pvzCode && !pvzAddress) return { error: 'Delivery PVZ code or address is required' };
+
+    const rawItems = Array.isArray(raw.items) ? raw.items : [];
+    const items = rawItems
+        .map((item, idx) => {
+            const quantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
+            const price = toPositiveNumber(item.price, 0);
+            const name = String(item.name || '').trim();
+            return {
+                ware_key: String(item.id || `ITEM${idx + 1}`),
+                name: name || `Товар ${idx + 1}`,
+                cost: price,
+                amount: quantity,
+                weight: 300,
+                payment: { value: 0 }
+            };
+        })
+        .filter((item) => item.cost > 0);
+
+    if (!items.length) return { error: 'At least one order item is required' };
+
+    return {
+        value: {
+            id: orderId,
+            number: orderId,
+            total: toPositiveNumber(raw.total, 0),
+            subtotal: toPositiveNumber(raw.subtotal, 0),
+            deliveryCost: toPositiveNumber(raw.deliveryCost ?? raw.delivery?.cost, 0),
+            createdAt: raw.date || new Date().toISOString(),
+            customer: {
+                name: customerName,
+                email: customerEmail,
+                phone: customerPhone
+            },
+            delivery: {
+                city: { code: cityCode, name: cityName || `Город ${cityCode}` },
+                pvz: { code: pvzCode, name: pvzName || 'ПВЗ', address: pvzAddress || pvzName }
+            },
+            items
+        }
+    };
+}
+
+function buildCdekOrderFromStoredOrder(order) {
+    const senderPhone = sanitizePhoneForCdek(CDEK_SENDER_PHONE);
+    const recipientPhone = sanitizePhoneForCdek(order.customer?.phone);
+    const itemTotalWeight = order.items.reduce((sum, item) => sum + (Math.max(1, item.amount) * 300), 0);
+
+    const payload = {
+        type: 1,
+        number: String(order.number || order.id),
+        tariff_code: Number(CDEK_DEFAULT_TARIFF_CODE),
+        sender: {
+            company: CDEK_SENDER_COMPANY,
+            name: CDEK_SENDER_NAME,
+            ...(CDEK_SENDER_EMAIL ? { email: CDEK_SENDER_EMAIL } : {}),
+            ...(senderPhone ? { phones: [{ number: senderPhone }] } : {})
+        },
+        recipient: {
+            name: String(order.customer.name),
+            phones: [{ number: recipientPhone }],
+            ...(order.customer.email ? { email: String(order.customer.email) } : {})
+        },
+        from_location: {
+            code: Number(CDEK_SENDER_CITY_CODE),
+            address: CDEK_SENDER_ADDRESS
+        },
+        to_location: {
+            code: Number(order.delivery.city.code),
+            address: order.delivery.pvz.address || order.delivery.pvz.name
+        },
+        packages: [{
+            number: `PKG-${String(order.id).slice(-8)}`,
+            weight: Math.max(500, itemTotalWeight),
+            length: 30,
+            width: 20,
+            height: 10,
+            items: order.items
+        }],
+        delivery_recipient_cost: {
+            value: toPositiveNumber(order.total, 0)
+        }
+    };
+
+    if (CDEK_SENDER_PVZ_CODE) payload.shipment_point = CDEK_SENDER_PVZ_CODE;
+    if (order.delivery?.pvz?.code) payload.delivery_point = order.delivery.pvz.code;
+
+    return payload;
+}
+
+async function createCdekOrderForPaidOrder(orderId) {
+    const ordersStore = await readOrdersStore();
+    const order = ordersStore[orderId];
+    if (!order) {
+        return { ok: false, reason: 'Order not found in server store' };
+    }
+
+    if (order?.cdek?.status === 'created' && order?.cdek?.uuid) {
+        return { ok: true, alreadyCreated: true, cdek: order.cdek };
+    }
+
+    const token = await getAuthToken();
+    if (!token) {
+        throw new Error('Unable to authenticate with CDEK API');
+    }
+
+    const cdekPayload = buildCdekOrderFromStoredOrder(order);
+    const response = await fetch('https://api.cdek.ru/v2/orders', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(cdekPayload)
+    });
+
+    const rawText = await response.text();
+    let data = {};
+    try { data = rawText ? JSON.parse(rawText) : {}; } catch { data = { raw: rawText }; }
+
+    const now = new Date().toISOString();
+    if (!response.ok) {
+        order.cdek = {
+            status: 'failed',
+            failedAt: now,
+            httpStatus: response.status,
+            requestPayload: cdekPayload,
+            error: data
+        };
+        order.updatedAt = now;
+        ordersStore[orderId] = order;
+        await writeOrdersStore(ordersStore);
+        return { ok: false, reason: 'CDEK API error', httpStatus: response.status, details: data };
+    }
+
+    order.cdek = {
+        status: 'created',
+        createdAt: now,
+        uuid: data?.entity?.uuid || data?.uuid || null,
+        cdekNumber: data?.entity?.cdek_number || data?.cdek_number || null,
+        requestPayload: cdekPayload,
+        response: data
+    };
+    order.updatedAt = now;
+    ordersStore[orderId] = order;
+    await writeOrdersStore(ordersStore);
+
+    return { ok: true, alreadyCreated: false, cdek: order.cdek };
 }
 
 function requireAdminAuth(req, res, next) {
@@ -453,6 +664,70 @@ app.delete('/api/admin/products/:id', requireAdminAuth, async (req, res) => {
         return res.json({ success: true });
     } catch (error) {
         return sendError(res, 500, 'Product delete failed', error.message);
+    }
+});
+
+app.get('/api/admin/orders', requireAdminAuth, async (req, res) => {
+    try {
+        const store = await readOrdersStore();
+        const list = Object.values(store || {})
+            .sort((a, b) => {
+                const at = new Date(a?.updatedAt || a?.createdAt || 0).getTime();
+                const bt = new Date(b?.updatedAt || b?.createdAt || 0).getTime();
+                return bt - at;
+            })
+            .map((order) => ({
+                id: order.id || order.number,
+                createdAt: order.createdAt || null,
+                updatedAt: order.updatedAt || null,
+                total: Number(order.total || 0),
+                customerName: order?.customer?.name || '',
+                customerPhone: order?.customer?.phone || '',
+                paymentStatus: order?.payment?.status || 'unknown',
+                paymentId: order?.payment?.paymentId || null,
+                cdekStatus: order?.cdek?.status || 'not_created',
+                cdekUuid: order?.cdek?.uuid || null,
+                cdekNumber: order?.cdek?.cdekNumber || null
+            }));
+        return res.json(list);
+    } catch (error) {
+        return sendError(res, 500, 'Orders read failed', error.message);
+    }
+});
+
+app.get('/api/admin/orders/:orderId/cdek', requireAdminAuth, async (req, res) => {
+    try {
+        const orderId = String(req.params.orderId || '').trim();
+        if (!orderId) {
+            return sendError(res, 400, 'Invalid request', 'orderId is required');
+        }
+
+        const store = await readOrdersStore();
+        const order = store[orderId];
+        if (!order) {
+            return sendError(res, 404, 'Not found', 'Order is not found');
+        }
+
+        return res.json({
+            orderId,
+            payment: order.payment || null,
+            cdek: {
+                status: order?.cdek?.status || 'not_created',
+                uuid: order?.cdek?.uuid || null,
+                cdekNumber: order?.cdek?.cdekNumber || null,
+                requestPayload: order?.cdek?.requestPayload || null,
+                response: order?.cdek?.response || null,
+                error: order?.cdek?.error || null,
+                createdAt: order?.cdek?.createdAt || null,
+                failedAt: order?.cdek?.failedAt || null
+            },
+            customer: order.customer || null,
+            delivery: order.delivery || null,
+            total: Number(order.total || 0),
+            updatedAt: order.updatedAt || null
+        });
+    } catch (error) {
+        return sendError(res, 500, 'Order CDEK details failed', error.message);
     }
 });
 
@@ -881,6 +1156,33 @@ app.post('/api/payment/webhook/yookassa', async (req, res) => {
             orderId: verifiedPayment?.metadata?.order_id
         });
 
+        const orderId = String(verifiedPayment?.metadata?.order_id || '').trim();
+        if (orderId) {
+            const ordersStore = await readOrdersStore();
+            const existing = ordersStore[orderId] || { id: orderId };
+            existing.payment = {
+                provider: 'yookassa',
+                paymentId: verifiedPayment.id,
+                status: verifiedPayment.status,
+                paid: Boolean(verifiedPayment.paid),
+                updatedAt: new Date().toISOString()
+            };
+            existing.updatedAt = new Date().toISOString();
+            ordersStore[orderId] = existing;
+            await writeOrdersStore(ordersStore);
+
+            if (event === 'payment.succeeded' && verifiedPayment.status === 'succeeded') {
+                const cdekResult = await createCdekOrderForPaidOrder(orderId);
+                console.log('CDEK post-payment order result:', {
+                    orderId,
+                    ok: cdekResult.ok,
+                    alreadyCreated: Boolean(cdekResult.alreadyCreated),
+                    reason: cdekResult.reason || null,
+                    uuid: cdekResult?.cdek?.uuid || null
+                });
+            }
+        }
+
         return res.status(200).json({ received: true });
     } catch (error) {
         return sendError(res, 500, 'Webhook processing failed', error.message);
@@ -889,24 +1191,75 @@ app.post('/api/payment/webhook/yookassa', async (req, res) => {
 
 app.post('/api/notify/order', async (req, res) => {
     try {
-        const order = req.body;
-        if (!order?.id || !order?.customer?.email || !isValidEmail(order.customer.email)) {
-            return sendError(res, 400, 'Invalid request', 'Order id and valid customer email are required');
+        const normalized = normalizeIncomingOrder(req.body);
+        if (normalized.error) {
+            return sendError(res, 400, 'Invalid request', normalized.error);
         }
 
-        console.log('Order notification received:', {
+        const order = normalized.value;
+        const now = new Date().toISOString();
+        const ordersStore = await readOrdersStore();
+        const previous = ordersStore[order.id] || {};
+
+        ordersStore[order.id] = {
+            ...previous,
+            ...order,
+            status: previous.status || 'pending_payment',
+            payment: {
+                ...(previous.payment || {}),
+                status: previous.payment?.status || 'pending'
+            },
+            cdek: previous.cdek || { status: 'not_created' },
+            updatedAt: now
+        };
+
+        await writeOrdersStore(ordersStore);
+
+        console.log('Order notification stored:', {
             orderId: order.id,
             customer: order.customer?.name,
             phone: order.customer?.phone,
             email: order.customer?.email,
             total: order.total,
-            delivery: order.delivery?.city?.name,
-            timestamp: new Date().toISOString()
+            deliveryCity: order.delivery?.city?.name,
+            deliveryPvz: order.delivery?.pvz?.code || order.delivery?.pvz?.address,
+            timestamp: now
         });
 
-        return res.json({ success: true, message: 'Notification logged', orderId: order.id, timestamp: new Date().toISOString() });
+        return res.json({
+            success: true,
+            message: 'Order stored',
+            orderId: order.id,
+            paymentStatus: ordersStore[order.id].payment.status,
+            cdekStatus: ordersStore[order.id].cdek.status,
+            timestamp: now
+        });
     } catch (error) {
         return sendError(res, 500, 'Failed to send notification', error.message);
+    }
+});
+
+app.get('/api/orders/:orderId', async (req, res) => {
+    try {
+        const orderId = String(req.params.orderId || '').trim();
+        if (!orderId) {
+            return sendError(res, 400, 'Invalid request', 'orderId is required');
+        }
+        const store = await readOrdersStore();
+        const order = store[orderId];
+        if (!order) {
+            return sendError(res, 404, 'Not found', 'Order is not found');
+        }
+        return res.json({
+            success: true,
+            orderId,
+            payment: order.payment || null,
+            cdek: order.cdek || null,
+            delivery: order.delivery || null,
+            updatedAt: order.updatedAt || null
+        });
+    } catch (error) {
+        return sendError(res, 500, 'Failed to fetch order', error.message);
     }
 });
 
@@ -993,6 +1346,8 @@ app.listen(PORT, () => {
     console.log(`Admin panel configured: ${isAdminConfigured() ? 'YES' : 'NO'}`);
     console.log(`Admin login protection: max ${ADMIN_LOGIN_MAX_ATTEMPTS} attempts per ${ADMIN_LOGIN_WINDOW_MS}ms, block ${ADMIN_BLOCK_MS}ms`);
     console.log(`Products file: ${PRODUCTS_FILE_PATH}`);
+    console.log(`Orders file: ${ORDERS_FILE_PATH}`);
+    console.log(`CDEK sender contact configured: ${CDEK_SENDER_PHONE ? 'YES' : 'NO'}`);
     console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
     console.log(`Allowed return hosts: ${ALLOWED_RETURN_HOSTS.join(', ')}`);
     console.log('============================================');
